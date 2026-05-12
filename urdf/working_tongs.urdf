@@ -1,0 +1,94 @@
+<?xml version="1.0"?>
+<robot name="working_tongs">
+
+  <!-- tongs base -->
+  <link name="tongs_base">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="0.0005" ixy="0" ixz="0" iyy="0.0005" iyz="0" izz="0.0005"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.02 0.02 0.02"/>
+      </geometry>
+      <material name="gray">
+        <color rgba="0.5 0.5 0.5 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.02 0.02 0.02"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- left tong -->
+  <link name="left_tong">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.00005" ixy="0" ixz="0" iyy="0.00005" iyz="0" izz="0.00005"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.006 0.002 0.08"/>
+      </geometry>
+      <material name="dark_gray">
+        <color rgba="0.3 0.3 0.3 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.006 0.002 0.08"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- right tong -->
+  <link name="right_tong">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.00005" ixy="0" ixz="0" iyy="0.00005" iyz="0" izz="0.00005"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.006 0.002 0.08"/>
+      </geometry>
+      <material name="dark_gray">
+        <color rgba="0.3 0.3 0.3 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.006 0.002 0.08"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- left tong joint - WORKING DESIGN -->
+  <joint name="left_tong_joint" type="prismatic">
+    <parent link="tongs_base"/>
+    <child link="left_tong"/>
+    <origin xyz="0 0.001 0.04"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="0.005" effort="10" velocity="0.1"/>
+  </joint>
+
+  <!-- right tong joint - WORKING DESIGN -->
+  <joint name="right_tong_joint" type="prismatic">
+    <parent link="tongs_base"/>
+    <child link="right_tong"/>
+    <origin xyz="0 -0.001 0.04"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="0.0" upper="0.005" effort="10" velocity="0.1"/>
+  </joint>
+
+</robot>

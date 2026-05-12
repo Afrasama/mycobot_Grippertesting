@@ -1,0 +1,165 @@
+<?xml version="1.1"?>
+<robot name="mycobot_320">
+
+  <!-- base -->
+  <link name="base">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/base.dae"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 1.5708"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/base.dae"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 1.5708"/>
+    </collision>
+  </link>
+
+  <!-- link1 -->
+  <link name="link1">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link1.dae"/>
+      </geometry>
+      <origin xyz="0 0 -0.078" rpy="0 0 1.5708"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/link1.dae"/>
+      </geometry>
+      <origin xyz="0 0 -0.078" rpy="0 0 1.5708"/>
+    </collision>
+  </link>
+
+  <!-- link2 -->
+  <link name="link2">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link2.dae"/>
+      </geometry>
+      <origin xyz="0 0 -0.04" rpy="0 1.5708 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/link2.dae"/>
+      </geometry>
+      <origin xyz="0 0 -0.04" rpy="0 1.5708 0"/>
+    </collision>
+  </link>
+
+  <!-- link3 -->
+  <link name="link3">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link3.dae"/>
+      </geometry>
+      <origin xyz="0 0 0.039" rpy="1.5708 1.5708 1.5708"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/link3.dae"/>
+      </geometry>
+      <origin xyz="0 0 0.039" rpy="1.5708 1.5708 1.5708"/>
+    </collision>
+  </link>
+
+  <!-- link4 -->
+  <link name="link4">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link4.dae"/>
+      </geometry>
+      <origin xyz="0 -0.0024 -0.05" rpy="1.5708 1.5708 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/link4.dae"/>
+      </geometry>
+      <origin xyz="0 -0.0024 -0.05" rpy="1.5708 1.5708 0"/>
+    </collision>
+  </link>
+
+  <!-- link5 -->
+  <link name="link5">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link5.dae"/>
+      </geometry>
+      <origin xyz="0 0 -0.05" rpy="0 0 -1.5708"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/link5.dae"/>
+      </geometry>
+      <origin xyz="0 0 -0.05" rpy="0 0 -1.5708"/>
+    </collision>
+  </link>
+
+  <!-- link6 -->
+  <link name="link6">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link6.dae"/>
+      </geometry>
+      <origin xyz="0 0 -0.0115" rpy="1.5708 1.5708 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/link6.dae"/>
+      </geometry>
+      <origin xyz="0 0 -0.0115" rpy="1.5708 1.5708 0"/>
+    </collision>
+  </link>
+
+  <!-- joints -->
+  <joint name="joint1" type="revolute">
+    <parent link="base"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.1739" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.93" upper="2.93" effort="1000" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 -0.08878 0" rpy="0 -1.5708 1.5708"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.35" upper="2.35" effort="1000" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0.135 0 -0.08878" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.53" upper="2.53" effort="1000" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="0.120 0 0.08878" rpy="0 0 1.5708"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.53" upper="2.53" effort="1000" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0 -0.095 0" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.93" upper="2.93" effort="1000" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0 0.0655 0" rpy="-1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="1000" velocity="1.0"/>
+  </joint>
+
+</robot>
