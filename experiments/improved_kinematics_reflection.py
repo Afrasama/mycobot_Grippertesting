@@ -15,8 +15,8 @@ from utils.gui_status import gui_status
 import math
 from utils.logger import setup_execution_logger, log_robot_state, log_llm_decision, log_policy_update, log_session_summary
 
-# Optional offline "VLM-like" vision classifier (runs fully offline after training)
-USE_OFFLINE_VISION_CLASSIFIER = True
+# Optional offline CNN (extra scene hints). Default off — use Ollama for reflection.
+USE_OFFLINE_VISION_CLASSIFIER = os.getenv("USE_OFFLINE_VISION_CLASSIFIER", "0") == "1"
 offline_classifier = None
 
 # LLM-driven reflection agent. The backend can be set with LLM_AGENT_BACKEND.
@@ -74,33 +74,42 @@ for i in range(p.getNumJoints(robot)):
 
 print("End effector index:", ee_index)
 
-# ---------------- IMPROVED WIDE PARALLEL GRIPPER ----------------
-# Load wide parallel gripper for proper cube grasping
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-gripper_urdf = os.path.join(BASE_DIR, "urdf", "wide_parallel_gripper.urdf")
+# ---------------- PARALLEL GRIPPER (env: MYCOBOT_GRIPPER_URDF, basename under urdf/) ----------------
+_gripper_name = os.getenv("MYCOBOT_GRIPPER_URDF", "wide_parallel_gripper.urdf").strip()
+if not _gripper_name.lower().endswith(".urdf"):
+    _gripper_name += ".urdf"
+gripper_urdf = os.path.join(BASE_DIR, "urdf", os.path.basename(_gripper_name))
+if not os.path.isfile(gripper_urdf):
+    _fallback = os.path.join(BASE_DIR, "urdf", "wide_parallel_gripper.urdf")
+    print(f"Warning: gripper URDF not found ({gripper_urdf}), using {_fallback}")
+    gripper_urdf = _fallback
+GRIPPER_MODEL_NAME = os.path.basename(gripper_urdf)
 gripper = p.loadURDF(gripper_urdf)
+logger.info(f"Gripper model: {GRIPPER_MODEL_NAME} path={gripper_urdf}")
 
 # ---------------- TCP/TOOL OFFSET CALIBRATION ----------------
 # Proper gripper offset calibration for accurate positioning
 GRIPPER_TCP_OFFSET = [0.0, 0.0, 0.06]  # 6cm offset from link6 to gripper center (reduced)
-GRIPPER_ORIENTATION = [0, 0, 0, 1]  # Quaternion orientation (no rotation)
+# Must match move_to_position: tool Z down so parallel fingers straddle the cube from above.
+GRIPPER_ORIENTATION = p.getQuaternionFromEuler([0.0, math.pi, 0.0])
 
 def get_gripper_tcp_position():
-    """Get the calibrated TCP position of the gripper"""
+    """TCP in world frame: link6 pose + offset rotated into link6 frame."""
     ee_state = p.getLinkState(robot, ee_index)
     ee_pos, ee_orn = ee_state[0], ee_state[1]
-    
-    # Apply TCP offset
-    tcp_pos = np.array(ee_pos) + np.array(GRIPPER_TCP_OFFSET)
+    offset_world = np.array(p.rotateVector(ee_orn, GRIPPER_TCP_OFFSET))
+    tcp_pos = np.array(ee_pos) + offset_world
     return tcp_pos, ee_orn
 
+
 def set_gripper_tcp_target(target_pos, orientation=None):
-    """Set target position accounting for TCP offset"""
+    """IK target for link6 so that TCP (offset in link frame) reaches target_pos in world."""
     if orientation is None:
         orientation = GRIPPER_ORIENTATION
-    
-    # Calculate inverse kinematics with TCP offset compensation
-    compensated_target = np.array(target_pos) - np.array(GRIPPER_TCP_OFFSET)
+    ee_state = p.getLinkState(robot, ee_index)
+    _, ee_orn = ee_state[0], ee_state[1]
+    offset_world = np.array(p.rotateVector(ee_orn, GRIPPER_TCP_OFFSET))
+    compensated_target = np.array(target_pos) - offset_world
     return compensated_target, orientation
 
 # Get gripper joint indices for standard parallel gripper
@@ -121,12 +130,22 @@ for i in range(p.getNumJoints(gripper)):
 print(f"Standard parallel gripper joints: {gripper_joints}")
 print(f"Standard parallel gripper motor joint: {gripper_motor_joint}")
 
+GRIPPER_FINGER_OPEN = 0.025
+if gripper_joints:
+    _uppers = [float(p.getJointInfo(gripper, j)[9]) for j in gripper_joints]
+    if _uppers and max(_uppers) > 1e-6:
+        GRIPPER_FINGER_OPEN = max(_uppers)
+
 # Attach standard parallel gripper to robot end effector with proper TCP calibration
 def attach_standard_gripper():
     """Attach standard parallel gripper to robot end effector with calibrated TCP offset"""
     # Get end effector position and orientation
     ee_state = p.getLinkState(robot, ee_index)
     ee_pos, ee_orn = ee_state[0], ee_state[1]
+    
+    # Teleport gripper to end effector position with offset before constraining
+    gripper_pos, gripper_orn = p.multiplyTransforms(ee_pos, ee_orn, GRIPPER_TCP_OFFSET, [0, 0, 0, 1])
+    p.resetBasePositionAndOrientation(gripper, gripper_pos, gripper_orn)
     
     # Use calibrated TCP offset for proper gripper positioning
     constraint_id = p.createConstraint(
@@ -136,12 +155,14 @@ def attach_standard_gripper():
         childLinkIndex=-1,
         jointType=p.JOINT_FIXED,
         jointAxis=[0, 0, 0],
-        parentFramePosition=GRIPPER_TCP_OFFSET,  # Use calibrated offset
-        childFramePosition=[0, 0, 0]
+        parentFramePosition=GRIPPER_TCP_OFFSET,
+        childFramePosition=[0, 0, 0],
+        parentFrameOrientation=[0, 0, 0, 1],
+        childFrameOrientation=[0, 0, 0, 1]
     )
     
-    # Set constraint parameters for stable attachment with reduced force
-    p.changeConstraint(constraint_id, maxForce=30)  # Reduced force for smoother operation
+    # Set constraint parameters for stable attachment with high force
+    p.changeConstraint(constraint_id, maxForce=100000)  # High force for secure attachment
     
     print(f"Standard parallel gripper attached with calibrated TCP offset {GRIPPER_TCP_OFFSET}")
     print(f"Constraint ID: {constraint_id}")
@@ -149,24 +170,26 @@ def attach_standard_gripper():
 
 # Attach gripper
 attach_standard_gripper()
+for _gi in range(p.getNumJoints(gripper)):
+    p.changeDynamics(gripper, _gi, lateralFriction=2.5, rollingFriction=0.001)
+p.changeDynamics(gripper, -1, lateralFriction=2.5, rollingFriction=0.001)
 
 # Gripper control functions with improved alignment and smooth control
 def open_gripper():
-    """Open the wide parallel gripper smoothly with proper force control"""
+    """Open parallel fingers to URDF upper limit."""
     for joint_idx in gripper_joints:
         p.setJointMotorControl2(
             gripper,
             joint_idx,
             p.POSITION_CONTROL,
-            targetPosition=0.025,  # Open position - WIDE OPEN (25mm travel)
-            force=20,  # Reduced force for smoother operation
-            positionGain=0.05,  # Lower gain for gentler movement
-            velocityGain=0.1  # Reduced velocity gain
+            targetPosition=GRIPPER_FINGER_OPEN,
+            force=20,
+            positionGain=0.05,
+            velocityGain=0.1,
         )
-    print("Wide parallel gripper opening smoothly...")
-    # Add stabilization delay
-    time.sleep(0.5)
-    print("Wide parallel gripper opened WIDE")
+    print(f"Gripper opening to {GRIPPER_FINGER_OPEN:.4f} m ...")
+    time.sleep(0.35)
+    print("Gripper opened")
 
 def close_gripper():
     """Close the wide parallel gripper gradually with proper mechanical grasping"""
@@ -174,7 +197,7 @@ def close_gripper():
     
     # Gradual closing for better grip control
     for step in range(10):
-        target = 0.025 - (step * 0.0025)  # Gradual closing
+        target = GRIPPER_FINGER_OPEN * (1.0 - step / 9.0)
         for joint_idx in gripper_joints:
             p.setJointMotorControl2(
                 gripper,
@@ -201,9 +224,9 @@ def close_gripper():
             positionGain=0.08,  # Moderate gain for final grasp
             velocityGain=0.1  # Moderate velocity gain
         )
-    print("Wide parallel gripper closed - mechanical grasp")
+    print("Gripper closed - mechanical grasp")
     # Add stabilization delay after closing
-    time.sleep(0.3)
+    time.sleep(0.5)
 
 # Open gripper initially
 open_gripper()
@@ -499,9 +522,9 @@ logger.info(f"OPTIMAL PLACEMENT: Cube positioned at ({optimal_x:.3f}, {optimal_y
 p.changeDynamics(
     cube,
     -1,
-    lateralFriction=1.5,
-    linearDamping=0.4,
-    angularDamping=0.4,
+    lateralFriction=2.5,
+    linearDamping=0.35,
+    angularDamping=0.35,
     restitution=0.0,
 )
 
@@ -579,8 +602,11 @@ policy = {
 
 max_retries = 10
 retry_count = 0
-inject_failure = True
+inject_failure = os.getenv("INJECT_PERCEPTION_FAILURE", "0") == "1"
 perception_noise_scale = 0.08
+LLM_REFLECTION_MAX_RETRIES = int(os.getenv("LLM_REFLECTION_MAX_RETRIES", str(max_retries)))
+if inject_failure:
+    logger.info("INJECT_PERCEPTION_FAILURE: synthetic XY perception noise on first failure cycle.")
 
 # ---------------- IMPROVED SMOOTH MOTION WITH TCP CALIBRATION ----------------
 def smooth_move(target_pos, steps=500, slow_mode=False):
@@ -640,126 +666,201 @@ def smooth_move(target_pos, steps=500, slow_mode=False):
 
         p.stepSimulation()
         # Slower timing for smoother motion
-        time.sleep(1 / 120 if slow_mode else 1 / 240)
+        time.sleep(1/240)
 
 def stabilization_delay(duration=0.5):
     """Add stabilization delay for smooth transitions"""
     print(f"Stabilizing for {duration}s...")
     for _ in range(int(duration * 240)):
         p.stepSimulation()
-        time.sleep(1 / 240)
+        time.sleep(1/240)
+
+def descend_until_gripper_contact(cxy, z_start, z_floor, max_steps=30):
+    """Lower TCP in small steps until gripper and cube collision shapes report contact."""
+    z = float(z_start)
+    z_floor = float(z_floor)
+    for step_i in range(max_steps):
+        n = len(p.getContactPoints(gripper, cube))
+        if n > 0:
+            print(f"Contact during descent: z={z:.4f} m, {n} points (step {step_i})")
+            return True
+        z_next = max(z_floor, z - 0.0018)
+        if z_next >= z - 1e-6:
+            break
+        z = z_next
+        smooth_move([float(cxy[0]), float(cxy[1]), z], steps=50, slow_mode=True)
+        for _ in range(15):
+            p.stepSimulation()
+            time.sleep(1 / 240)
+    n = len(p.getContactPoints(gripper, cube))
+    print(f"Descent finished z={z:.4f} m, contacts={n}")
+    return n > 0
+
 
 # ---------------- STAGED MOVEMENT SEQUENCE ----------------
-def staged_pick_sequence(cube_pos):
-    """Implement staged pick-and-place sequence with proper alignment"""
-    print("\n=== STAGED PICK SEQUENCE START ===")
-    
-    # Stage 1: Open gripper wide
-    print("Stage 1: Opening gripper wide...")
-    open_gripper()
-    stabilization_delay(0.3)
-    
-    # Stage 2: Move above object with proper alignment
-    print("Stage 2: Moving above object...")
-    above_target = [cube_pos[0], cube_pos[1], cube_pos[2] + 0.12]  # 12cm above
-    smooth_move(above_target, steps=600, slow_mode=True)  # Very slow approach
-    stabilization_delay(0.5)
-    
-    # Stage 3: Descend slowly to object
-    print("Stage 3: Descending slowly to object...")
-    descend_target = [cube_pos[0], cube_pos[1], cube_pos[2] + 0.03]  # 3cm above
-    smooth_move(descend_target, steps=800, slow_mode=True)  # Extra slow descent
-    stabilization_delay(0.3)
-    
-    # Stage 4: Final approach and contact
-    print("Stage 4: Final approach to object...")
-    contact_target = [cube_pos[0], cube_pos[1], cube_pos[2] + 0.005]  # 0.5cm above (closer)
-    smooth_move(contact_target, steps=800, slow_mode=True)  # Ultra slow final approach
-    stabilization_delay(0.2)
-    
-    # Stage 4.5: Make gentle contact
-    print("Stage 4.5: Making gentle contact...")
-    contact_target = [cube_pos[0], cube_pos[1], cube_pos[2] - 0.002]  # Slightly into cube
-    smooth_move(contact_target, steps=400, slow_mode=True)  # Very slow contact
-    stabilization_delay(0.1)
-    
-    # Stage 5: Close gripper gradually
-    print("Stage 5: Closing gripper gradually...")
-    close_gripper()
-    stabilization_delay(0.5)
-    
-    # Stage 6: Verify grasp
-    print("Stage 6: Verifying grasp...")
-    grasp_verified = verify_grasp_stability()
-    
-    if grasp_verified:
-        print("Stage 7: Lifting vertically...")
-        # Lift vertically first
-        lift_target = [cube_pos[0], cube_pos[1], cube_pos[2] + 0.15]
-        smooth_move(lift_target, steps=600, slow_mode=True)
-        stabilization_delay(0.3)
+def check_grasp_contacts_pre_lift():
+    """Contacts + TCP–cube alignment while cube may still be on the table."""
+    try:
+        contacts = p.getContactPoints(gripper, cube)
+        print(f"Contact points found: {len(contacts)}")
+        if len(contacts) < 1:
+            print("No contacts detected")
+            return False
+        gripper_tcp_pos, _ = get_gripper_tcp_position()
+        cube_pos, _ = p.getBasePositionAndOrientation(cube)
+        distance = float(np.linalg.norm(np.array(gripper_tcp_pos) - np.array(cube_pos)))
+        if distance > 0.10:
+            print(f"Cube too far from TCP: {distance:.3f}m")
+            return False
+        print(f"Pre-lift grasp OK: {len(contacts)} contacts, TCP–cube {distance:.3f}m")
         return True
-    else:
-        print("Grasp verification failed!")
+    except Exception as e:
+        print(f"Error in pre-lift grasp check: {e}")
         return False
 
-def verify_grasp_stability():
-    """Verify if gripper has a stable grasp"""
-    # Check contact points between gripper and cube
-    contacts = p.getContactPoints(gripper, cube)
-    
-    print(f"Contact points found: {len(contacts)}")
-    
-    # More lenient contact requirement
-    if len(contacts) < 1:
-        print(f"No contacts detected")
+
+def mini_lift_grasp_test(cube_xy, pick_policy):
+    """Physics check: cube must rise with the arm and stay near TCP (no weld constraint)."""
+    cube_pos0, _ = p.getBasePositionAndOrientation(cube)
+    z0 = float(cube_pos0[2])
+    probe_lift = min(0.05, float(pick_policy["lift_height"]) * 0.22 + 0.02)
+    lift_target = [float(cube_xy[0]), float(cube_xy[1]), z0 + probe_lift]
+    smooth_move(lift_target, steps=220, slow_mode=True)
+    for _ in range(50):
+        p.stepSimulation()
+        time.sleep(1 / 240)
+    cube_pos1, _ = p.getBasePositionAndOrientation(cube)
+    z1 = float(cube_pos1[2])
+    if z1 - z0 < 0.003:
+        print(f"Lift test failed: cube did not rise (dz={z1 - z0:.4f}m)")
         return False
-    
-    # Check if cube is close to gripper
-    gripper_tcp_pos, _ = get_gripper_tcp_position()
-    cube_pos, _ = p.getBasePositionAndOrientation(cube)
-    
-    distance = np.linalg.norm(np.array(gripper_tcp_pos) - np.array(cube_pos))
-    if distance > 0.08:  # 8cm tolerance (more lenient)
-        print(f"Cube too far from gripper: {distance:.3f}m")
+    tcp, _ = get_gripper_tcp_position()
+    dist = float(np.linalg.norm(np.array(tcp) - np.array(cube_pos1)))
+    if dist > 0.10:
+        print(f"Lift test failed: cube slipped from TCP (d={dist:.3f}m)")
         return False
-    
-    # Check if cube is being lifted (Z position change)
-    cube_z = cube_pos[2]
-    if cube_z < 0.015:  # Cube should be lifted from table
-        print(f"Cube not lifted enough: {cube_z:.3f}m")
-        return False
-    
-    print(f"Grasp verified: {len(contacts)} contacts, distance: {distance:.3f}m, cube_z: {cube_z:.3f}m")
+    print(f"Lift test OK: dz={z1 - z0:.4f}m, TCP–cube={dist:.3f}m")
     return True
 
-def staged_place_sequence(goal_pos):
-    """Implement staged place sequence with proper alignment"""
-    print("\n=== STAGED PLACE SEQUENCE START ===")
-    
-    # Stage 1: Move above goal position
-    print("Stage 1: Moving above goal...")
-    above_goal = [goal_pos[0], goal_pos[1], goal_pos[2] + 0.12]
-    smooth_move(above_goal, steps=600, slow_mode=True)
-    stabilization_delay(0.3)
-    
-    # Stage 2: Descend to placement height
-    print("Stage 2: Descending to placement height...")
-    place_target = [goal_pos[0], goal_pos[1], goal_pos[2] + 0.03]
-    smooth_move(place_target, steps=800, slow_mode=True)
-    stabilization_delay(0.3)
-    
-    # Stage 3: Release object
-    print("Stage 3: Releasing object...")
+
+def staged_pick_sequence(cube_pos, pick_policy, local_retry=False):
+    """Pick using policy heights. If local_retry after grasp_failure, skip high hover and re-approach from current pose."""
+    cz = float(cube_pos[2])
+    ah = float(pick_policy["approach_height"])
+    gh = float(pick_policy["grasp_height"])
+    lh = float(pick_policy["lift_height"])
+    hover_z = cz + max(ah, gh + 0.02)
+    grasp_plane_z = cz + gh
+    fine_z = cz + max(0.002, min(0.012, 0.22 * gh + 0.002))
+    touch_z = cz - 0.005
+
+    if local_retry:
+        print("\n=== LOCAL PICK RETRY (stay near cube — no retreat over goal / high hover) ===")
+    else:
+        print("\n=== STAGED PICK SEQUENCE START ===")
+
+    print("Stage 1: Opening gripper...")
     open_gripper()
-    stabilization_delay(0.5)
-    
-    # Stage 4: Lift away
-    print("Stage 4: Lifting away...")
-    lift_away = [goal_pos[0], goal_pos[1], goal_pos[2] + 0.15]
-    smooth_move(lift_away, steps=600, slow_mode=True)
-    stabilization_delay(0.3)
-    
+    stabilization_delay(0.12 if local_retry else 0.22)
+
+    if not local_retry:
+        print(f"Stage 2: Hover z={hover_z:.4f} (approach_height={ah:.4f}, grasp_height={gh:.4f})")
+        smooth_move([cube_pos[0], cube_pos[1], hover_z], steps=420, slow_mode=True)
+        stabilization_delay(0.35)
+
+        print(f"Stage 3: Descend to grasp plane z={grasp_plane_z:.4f}")
+        smooth_move([cube_pos[0], cube_pos[1], grasp_plane_z], steps=520, slow_mode=True)
+        stabilization_delay(0.22)
+
+        print(f"Stage 4: Fine approach z={fine_z:.4f}")
+        smooth_move([cube_pos[0], cube_pos[1], fine_z], steps=480, slow_mode=True)
+        stabilization_delay(0.15)
+
+        print(f"Stage 4.5: Contact z={touch_z:.4f}")
+        smooth_move([cube_pos[0], cube_pos[1], touch_z], steps=220, slow_mode=True)
+        stabilization_delay(0.15)
+    else:
+        tcp, _ = get_gripper_tcp_position()
+        tz = float(tcp[2])
+        print(f"Local retry from TCP z={tz:.4f} (cube z={cz:.4f})")
+        # One shortcut lower only if still high; never go up to hover over the goal (red marker) first
+        if tz > cz + 0.09:
+            bridge_z = max(grasp_plane_z, cz + 0.035)
+            print(f"Stage L2a: Shortcut descend to z={bridge_z:.4f} (skip high hover)")
+            smooth_move([cube_pos[0], cube_pos[1], bridge_z], steps=260, slow_mode=True)
+            stabilization_delay(0.12)
+        print(f"Stage L2b: Fine approach z={fine_z:.4f}")
+        smooth_move([cube_pos[0], cube_pos[1], fine_z], steps=220, slow_mode=True)
+        stabilization_delay(0.1)
+        print(f"Stage L2c: Contact z={touch_z:.4f}")
+        smooth_move([cube_pos[0], cube_pos[1], touch_z], steps=160, slow_mode=True)
+        stabilization_delay(0.1)
+
+    print("Stage 4.6: Ensure gripper–cube contact (descend / nudge if needed)...")
+    contacts_before = p.getContactPoints(gripper, cube)
+    print(f"Contacts before alignment: {len(contacts_before)}")
+    z_floor = max(0.008, cz - 0.012)
+    if len(contacts_before) == 0:
+        descend_until_gripper_contact([cube_pos[0], cube_pos[1]], touch_z, z_floor)
+    contacts_before = p.getContactPoints(gripper, cube)
+    if len(contacts_before) == 0:
+        for ox, oy in ((0.006, 0.0), (-0.006, 0.0), (0.0, 0.006), (0.0, -0.006)):
+            smooth_move([cube_pos[0] + ox, cube_pos[1] + oy, touch_z], steps=100, slow_mode=True)
+            stabilization_delay(0.08)
+            descend_until_gripper_contact([cube_pos[0] + ox, cube_pos[1] + oy], touch_z, z_floor)
+            if len(p.getContactPoints(gripper, cube)) > 0:
+                break
+    print(f"Contacts after alignment: {len(p.getContactPoints(gripper, cube))}")
+
+    print("Stage 5: Close gripper...")
+    close_gripper()
+    stabilization_delay(0.4)
+
+    print("Stage 6: Pre-lift contact check...")
+    if not check_grasp_contacts_pre_lift():
+        open_gripper()
+        stabilization_delay(0.2)
+        return False
+
+    print("Stage 6b: Mini lift grasp test...")
+    if not mini_lift_grasp_test(cube_pos, pick_policy):
+        open_gripper()
+        stabilization_delay(0.2)
+        return False
+
+    print(f"Stage 7: Lift to carry height (lift_height={lh:.4f})")
+    cube_now, _ = p.getBasePositionAndOrientation(cube)
+    lift_target = [float(cube_now[0]), float(cube_now[1]), float(cube_now[2]) + max(lh * 0.5, 0.08)]
+    smooth_move(lift_target, steps=420, slow_mode=True)
+    stabilization_delay(0.25)
+    print("=== LOCAL PICK RETRY COMPLETE ===" if local_retry else "=== STAGED PICK SEQUENCE COMPLETE ===")
+    return True
+
+
+def staged_place_sequence(goal_pos, place_policy):
+    """Place using same policy height semantics as pick."""
+    print("\n=== STAGED PLACE SEQUENCE START ===")
+    gz = float(goal_pos[2])
+    ah = float(place_policy["approach_height"])
+    gh = float(place_policy["grasp_height"])
+    lh = float(place_policy["lift_height"])
+    hover_goal_z = gz + max(ah, gh + 0.02)
+
+    print("Stage 1: Moving above goal...")
+    smooth_move([goal_pos[0], goal_pos[1], hover_goal_z], steps=420, slow_mode=True)
+    stabilization_delay(0.22)
+
+    print("Stage 2: Descend to release height...")
+    smooth_move([goal_pos[0], goal_pos[1], gz + gh], steps=520, slow_mode=True)
+    stabilization_delay(0.22)
+
+    print("Stage 3: Release...")
+    open_gripper()
+    stabilization_delay(0.35)
+
+    print("Stage 4: Retract...")
+    smooth_move([goal_pos[0], goal_pos[1], gz + lh], steps=420, slow_mode=True)
+    stabilization_delay(0.22)
     print("=== STAGED PLACE SEQUENCE COMPLETE ===")
 
 # ---------------- ADAPTIVE RETRY LOGIC ----------------
@@ -835,7 +936,6 @@ def print_gripper_friction_recommendations():
 state = "plan"
 timer = 0
 stable_counter = 0
-constraint_id = None
 last_failure_type = "startup"
 last_distance_to_goal = None
 attempt_history = []
@@ -889,6 +989,8 @@ while p.isConnected():
     gui_status.update_metrics(retry_count + 1, current_distance_to_goal)
         
     if state == "plan":
+        successful_grasp = False
+        successful_placement = False
         print("\nPlanning attempt", retry_count + 1)
         
         # Check if goal position is reachable
@@ -933,6 +1035,10 @@ while p.isConnected():
 
         grasp_target = perceived_cube_pos.copy()
         grasp_target[2] += policy["grasp_height"]
+        logger.info(
+            f"Plan targets: approach_z={approach_target[2]:.4f} grasp_z={grasp_target[2]:.4f} "
+            f"offsets xy=({policy['x_offset']:.4f},{policy['y_offset']:.4f})"
+        )
 
         state = "approach"
         timer = 0
@@ -943,7 +1049,10 @@ while p.isConnected():
         log_robot_state(logger, "APPROACHING", "Using staged pick sequence", retry_count + 1)
         
         # Use new staged pick sequence with proper TCP calibration
-        grasp_success = staged_pick_sequence(perceived_cube_pos)
+        local_pick_retry = last_failure_type == "grasp_failure" and retry_count > 0
+        if local_pick_retry:
+            logger.info("LOCAL_PICK_RETRY: continuing from near-cube pose (no full re-hover)")
+        grasp_success = staged_pick_sequence(perceived_cube_pos, policy, local_retry=local_pick_retry)
         
         if grasp_success:
             successful_grasp = True
@@ -952,120 +1061,10 @@ while p.isConnected():
             print("Staged pick sequence completed successfully!")
         else:
             print("Staged pick sequence failed!")
-            state = "failed"
-            timer = 0
-
-    elif state == "grasp":
-        grip_pos = p.getLinkState(robot, ee_index)[0]
-        cube_pos, _ = p.getBasePositionAndOrientation(cube)
-
-        dist = float(np.linalg.norm(np.array(grip_pos) - np.array(cube_pos)))
-        print(f"Gripper position: {grip_pos}")
-        print(f"Cube position: {cube_pos}")
-        print(f"Distance: {dist}")
-
-        if (dist < 0.08 and retry_count > 0) or (dist < 0.08 and not inject_failure):
-            # PROPER GRASP SEQUENCE: Approach → Open → Grasp → Lock → Move → Place
-            print("Starting proper grasp sequence...")
-            
-            # Step 1: Open gripper wide before approaching cube
-            print("Step 1: Opening gripper wide...")
-            open_gripper()
-            for _ in range(30):
-                p.stepSimulation()
-            
-            # Step 2: Move to proper grasping position (sides of cube, not top)
-            print("Step 2: Positioning gripper at cube side level...")
-            cube_side_pos = np.array(cube_pos)  # Convert tuple to numpy array
-            cube_side_pos[2] += 0.015  # Position at middle of cube height
-            smooth_move(cube_side_pos, slow_mode=True)
-            for _ in range(40):
-                p.stepSimulation()
-            
-            # Step 3: Close gripper around cube from sides
-            print("Step 3: Closing gripper around cube from sides...")
-            close_gripper()
-            
-            # Step 4: Wait for proper mechanical contact
-            print("Step 4: Establishing mechanical contact...")
-            for _ in range(60):
-                p.stepSimulation()
-            
-            # Step 5: Check for proper side grasp (not top attachment)
-            print("Step 5: Verifying side grasp...")
-            contacts = p.getContactPoints(gripper, cube)
-            if len(contacts) >= 2:
-                # Check if contacts are on sides (not top)
-                side_contacts = 0
-                for contact in contacts:
-                    # Contact point on gripper
-                    contact_point = contact[5]
-                    # Check if contact is on side fingers (not top)
-                    if abs(contact_point[2] - cube_pos[2]) < 0.02:  # Within cube height range
-                        side_contacts += 1
-                
-                if side_contacts >= 2:
-                    print("Proper side grasp confirmed!")
-                    
-                    # Step 6: Lock the grasp with constraint
-                    print("Step 6: Locking grasp...")
-                    ee_state = p.getLinkState(robot, ee_index)
-                    ee_pos = ee_state[0]
-                    cube_pos_current, _ = p.getBasePositionAndOrientation(cube)
-                    final_distance = float(np.linalg.norm(np.array(ee_pos) - np.array(cube_pos_current)))
-                    
-                    print(f"FINAL DISTANCE AFTER SIDE GRASP: {final_distance:.6f}")
-                    print(f"Gripper position after grasp: {ee_pos}")
-                    print(f"Cube position after grasp: {cube_pos_current}")
-                    
-                    # Create constraint for proper grasp
-                    relative_offset = [
-                        cube_pos_current[0] - ee_pos[0],
-                        cube_pos_current[1] - ee_pos[1],
-                        cube_pos_current[2] - ee_pos[2] - 0.002,  # Minimal offset for side grasp
-                    ]
-                    
-                    constraint_id = p.createConstraint(
-                        gripper,
-                        -1,
-                        cube,
-                        -1,
-                        p.JOINT_FIXED,
-                        [0, 0, 0],
-                        [0, 0, 0],
-                        relative_offset,
-                    )
-                    p.changeConstraint(constraint_id, maxForce=30)  # Lower force for side grasp
-
-                    print("Cube properly grasped from sides and locked!")
-                    gui_status.update_status("Grasped", f"Cube grasped from sides - Distance: {final_distance:.4f}")
-                    gui_status.display_status()
-                    log_robot_state(logger, "GRASPED", f"Cube grasped from sides - Distance: {final_distance:.4f}", retry_count + 1)
-                    successful_grasp = True
-                    state = "lift"
-                    timer = 0
-                else:
-                    print("Side grasp failed - contacts not on sides")
-                    gui_status.update_status("Failed", "Side grasp failed - contacts not on sides")
-                    gui_status.display_status()
-                    log_robot_state(logger, "FAILED", "Side grasp failed - contacts not on sides", retry_count + 1)
-                    last_failure_type = "grasp_failure"
-                    state = "analyze"
-            else:
-                print("Side grasp failed - insufficient contacts")
-                gui_status.update_status("Failed", "Side grasp failed - insufficient contacts")
-                gui_status.display_status()
-                log_robot_state(logger, "FAILED", "Side grasp failed - insufficient contacts", retry_count + 1)
-                last_failure_type = "grasp_failure"
-                state = "analyze"
-
-        else:
-            print("Grasp failed - too far from object")
-            gui_status.update_status("Failed", "Grasp failed - too far from object")
-            gui_status.display_status()
-            log_robot_state(logger, "FAILED", "Grasp failed - too far from object", retry_count + 1)
+            successful_grasp = False
             last_failure_type = "grasp_failure"
             state = "analyze"
+            timer = 0
 
     elif state == "lift":
         gui_status.update_status("Lifting", "Moving to place position")
@@ -1073,9 +1072,8 @@ while p.isConnected():
         log_robot_state(logger, "LIFTING", "Moving to place position", retry_count + 1)
         
         # Use new staged place sequence with proper TCP calibration
-        staged_place_sequence(goal_position)
-        
-        successful_placement = True
+        staged_place_sequence(goal_position, policy)
+
         state = "observe"
         timer = 0
         stable_counter = 0
@@ -1090,15 +1088,25 @@ while p.isConnected():
                 goal_pos, _ = p.getBasePositionAndOrientation(goal)
             except Exception as e:
                 print(f"Error getting object positions: {e}")
-                break
+                # Use last known positions or defaults
+                cube_pos = [0.2, 0.0, 0.02]  # Default center
+                goal_pos = [0.0, 0.0, 0.025]  # Default goal
+                print("Using default positions for observation")
             
             # Calculate distance to goal
             distance_to_goal = float(np.linalg.norm(np.array(cube_pos) - np.array(goal_pos)))
-            
+            last_distance_to_goal = distance_to_goal
+
             # Calculate cube height and surface check
             cube_z = cube_pos[2]
             surface_z = 0.025  # Table surface height
             is_on_surface = abs(cube_z - surface_z) < 0.01
+            
+            try:
+                linear_velocity, _ = p.getBaseVelocity(cube)
+                speed = float(np.linalg.norm(linear_velocity))
+            except Exception:
+                speed = 0.0
             
             print(f"Object height: {cube_z:.3f}m, Surface height: {surface_z:.3f}m, On surface: {is_on_surface}")
 
@@ -1117,8 +1125,6 @@ while p.isConnected():
                 else:
                     print("SUCCESS -> task completed (object properly placed on surface)")
                     successful_placement = True
-                    print(f"DEBUG: successful_placement set to {successful_placement}")
-                    print(f"DEBUG: retry_count = {retry_count}")
                     state = "done"
                     attempt_distances.append(distance_to_goal)
                 break  # Exit observe loop
@@ -1147,19 +1153,27 @@ while p.isConnected():
         gui_status.display_status()
         log_robot_state(logger, "REFLECTING", "Adaptive retry analysis and parameter adjustment", retry_count + 1)
         
-        # Get current cube position for analysis
-        cube_pos, _ = p.getBasePositionAndOrientation(cube)
+        # Get current cube position for analysis with error handling
+        try:
+            cube_pos, _ = p.getBasePositionAndOrientation(cube)
+        except Exception as e:
+            print(f"Error getting cube position for analysis: {e}")
+            # Use last known position or default
+            cube_pos = [0.2, 0.0, 0.02]  # Default center position
+            print("Using default cube position for analysis")
         
-        # Apply adaptive retry adjustments
-        updated_policy = adaptive_retry_adjustment(last_failure_type, cube_pos, policy)
-        
-        # Update policy with adaptive adjustments
-        policy.update(updated_policy)
-        
-        print(f"Policy updated for retry {retry_count + 1}: {policy}")
-        
-        # Optionally use LLM for additional analysis
-        if USE_LLM_AGENT and retry_count < 3:  # Use LLM for first few retries only
+        llm_will_run = (
+            USE_LLM_AGENT
+            and agent.is_configured()
+            and retry_count < LLM_REFLECTION_MAX_RETRIES
+        )
+
+        if not llm_will_run:
+            updated_policy = adaptive_retry_adjustment(last_failure_type, cube_pos, policy)
+            policy.update(updated_policy)
+            print(f"Heuristic policy for retry {retry_count + 1}: {policy}")
+
+        if llm_will_run:
             print("\n========== LLM REFLECTION ==========")
             error, rgb = get_relative_pixel_error_overhead_and_rgb(
                 target_body_id=cube,
@@ -1198,111 +1212,51 @@ while p.isConnected():
                 "offline_direction_confidence": offline_confidence,
             }
 
-            decision = agent.reflect_and_decide(scene_info)
-            if decision:
-                # Apply LLM decisions if they don't conflict with adaptive adjustments
-                llm_updates = decision.get("updates", {})
-                for key, value in llm_updates.items():
-                    if key in policy and value is not None:
-                        # Apply LLM update if it's reasonable
-                        if key in ["approach_height", "grasp_height", "lift_height"]:
-                            if 0.05 <= value <= 0.30:  # Safety bounds
-                                policy[key] = value
-                        elif key == "release_delay":
-                            if 30 <= value <= 120:  # Safety bounds
-                                policy[key] = value
-                        else:
-                            policy[key] = value
-                
-                print(f"LLM decision applied: {decision}")
-        
-        retry_count += 1
-        state = "plan"
-        timer = 0
-        print("====================================\n")
+            decision = agent.reflect(
+                scene_info=scene_info,
+                policy=policy,
+                rgb=rgb,
+                history=attempt_history,
+            )
 
-        error, rgb = get_relative_pixel_error_overhead_and_rgb(
-            target_body_id=cube,
-            reference_body_id=gripper,
-            verbose=False,
-        )
+            print("Agent mode:", decision.mode)
+            print("Agent explanation:", decision.explanation)
+            print("Proposed updates:", decision.updates)
+            if decision.confidence is not None:
+                print("Agent confidence:", round(decision.confidence, 3))
+            
+            # Log LLM decision
+            log_llm_decision(logger, decision)
+            
+            # Update GUI with LLM decision
+            confidence_str = f"{decision.confidence:.2f}" if decision.confidence is not None else "N/A"
+            explanation_str = decision.explanation[:100] + ("..." if len(decision.explanation) > 100 else "")
+            llm_summary = f"Mode: {decision.mode} | Confidence: {confidence_str}\nExplanation: {explanation_str}"
+            gui_status.update_status("Reflecting", "LLM analysis complete", llm_summary)
+            gui_status.display_status()
 
-        pixel_error_x = 0.0
-        pixel_error_y = 0.0
-        cube_visible = error is not None
-        offline_summary = None
-        offline_confidence = None
+            old_policy = policy.copy()
+            policy = apply_policy_updates(policy, decision.updates)
+            log_policy_update(logger, old_policy, policy)
+            print("Updated policy:", policy)
 
-        if error is None:
-            print("Cube not visible -> agent must reason with limited observations")
-        else:
-            pixel_error_x, pixel_error_y = error
+            attempt_history.append(
+                {
+                    "retry": int(retry_count),
+                    "failure_type": last_failure_type,
+                    "cube_visible": bool(cube_visible),
+                    "pixel_error_x": float(pixel_error_x),
+                    "pixel_error_y": float(pixel_error_y),
+                    "distance_to_goal": None if last_distance_to_goal is None else float(last_distance_to_goal),
+                    "updates": decision.updates,
+                    "mode": decision.mode,
+                }
+            )
 
-        if offline_classifier is not None:
-            try:
-                pred = offline_classifier.predict(rgb)
-                offline_summary = pred.label
-                offline_confidence = float(pred.confidence)
-                print(f"OfflineVLM: {pred.label} (conf={pred.confidence:.2f})")
-            except Exception as exc:
-                print("OfflineVLM prediction failed:", exc)
-
-        scene_info = {
-            "failure_type": last_failure_type,
-            "retry_count": int(retry_count),
-            "cube_visible": bool(cube_visible),
-            "pixel_error_x": float(pixel_error_x),
-            "pixel_error_y": float(pixel_error_y),
-            "distance_to_goal": None if last_distance_to_goal is None else float(last_distance_to_goal),
-            "offline_direction_label": offline_summary,
-            "offline_direction_confidence": offline_confidence,
-        }
-
-        decision = agent.reflect(
-            scene_info=scene_info,
-            policy=policy,
-            rgb=rgb,
-            history=attempt_history,
-        )
-
-        print("Agent mode:", decision.mode)
-        print("Agent explanation:", decision.explanation)
-        print("Proposed updates:", decision.updates)
-        if decision.confidence is not None:
-            print("Agent confidence:", round(decision.confidence, 3))
-        
-        # Log LLM decision
-        log_llm_decision(logger, decision)
-        
-        # Update GUI with LLM decision
-        confidence_str = f"{decision.confidence:.2f}" if decision.confidence is not None else "N/A"
-        explanation_str = decision.explanation[:100] + ("..." if len(decision.explanation) > 100 else "")
-        llm_summary = f"Mode: {decision.mode} | Confidence: {confidence_str}\nExplanation: {explanation_str}"
-        gui_status.update_status("Reflecting", "LLM analysis complete", llm_summary)
-        gui_status.display_status()
-
-        old_policy = policy.copy()
-        policy = apply_policy_updates(policy, decision.updates)
-        log_policy_update(logger, old_policy, policy)
-        print("Updated policy:", policy)
-
-        attempt_history.append(
-            {
-                "retry": int(retry_count),
-                "failure_type": last_failure_type,
-                "cube_visible": bool(cube_visible),
-                "pixel_error_x": float(pixel_error_x),
-                "pixel_error_y": float(pixel_error_y),
-                "distance_to_goal": None if last_distance_to_goal is None else float(last_distance_to_goal),
-                "updates": decision.updates,
-                "mode": decision.mode,
-            }
-        )
-
-        if decision.terminate:
-            print("Agent requested termination")
-            state = "done"
-            continue
+            if decision.terminate:
+                print("Agent requested termination")
+                state = "done"
+                continue
 
         print("====================================\n")
 
@@ -1313,14 +1267,29 @@ while p.isConnected():
 
     elif state == "done":
         print("Terminating simulation.")
-        # Log session summary with correct success detection
-        actual_attempts = retry_count + 1  # Since retry_count starts at 0
-        success = successful_placement  # Based on actual task completion
-        log_session_summary(logger, actual_attempts, last_distance_to_goal or 0.0, success)
+        actual_attempts = retry_count + 1
+        success = successful_placement
+        logger.info(
+            f"TASK_OUTCOME place_ok={success} grasp_ok={successful_grasp} "
+            f"attempts={actual_attempts} d_goal_m={last_distance_to_goal}"
+        )
+        log_session_summary(
+            logger,
+            actual_attempts,
+            last_distance_to_goal or 0.0,
+            success,
+            grasp_success=successful_grasp,
+            gripper_model=GRIPPER_MODEL_NAME,
+            failure_type="" if success else last_failure_type,
+        )
+        print(
+            f"RESULT: place={'OK' if success else 'FAIL'} grasp={'OK' if successful_grasp else 'FAIL'} "
+            f"attempts={actual_attempts} dist_goal={(last_distance_to_goal or 0.0):.3f}m"
+        )
         break
 
     p.stepSimulation()
-    # time.sleep(1 / 240)  # Removed to unlock the simulation frame rate
+    time.sleep(1/240)  # Maintain simulation step rate
 
 p.disconnect()
 
