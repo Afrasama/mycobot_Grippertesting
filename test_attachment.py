@@ -51,15 +51,18 @@ def test_gripper_attachment():
     
     # Create fixed constraint
     constraint = p.createConstraint(
-        robot, ee_index,
-        gripper, -1,
-        p.JOINT_FIXED,
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
+        parentBodyUniqueId=robot, 
+        parentLinkIndex=ee_index,
+        childBodyUniqueId=gripper, 
+        childLinkIndex=-1,
+        jointType=p.JOINT_FIXED,
+        jointAxis=[0, 0, 0],
+        parentFramePosition=[0, 0, 0.05],
+        childFramePosition=[0, 0, 0],
+        childFrameOrientation=p.getQuaternionFromEuler([0,0,0])
     )
     
-    p.changeConstraint(constraint, maxForce=50)
+    p.changeConstraint(constraint, maxForce=50000)
     
     # Test by moving robot and checking gripper position
     print("\nTesting attachment...")
@@ -94,9 +97,9 @@ def test_gripper_attachment():
     print(f"Distance between EE and gripper: {distance}")
     
     if distance < 0.01:
-        print("✓ Gripper is properly attached!")
+        print("[SUCCESS] Gripper is properly attached!")
     else:
-        print("✗ Gripper attachment failed!")
+        print("[FAILED] Gripper attachment failed!")
     
     p.disconnect()
 

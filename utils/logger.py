@@ -85,7 +85,11 @@ def log_llm_decision(logger, decision):
     logger.info("LLM DECISION")
     logger.info("=" * 60)
     logger.info(f"Mode: {decision.mode}")
-    logger.info(f"Confidence: {decision.confidence:.3f}" if decision.confidence else "Confidence: N/A")
+    logger.info(
+        f"Confidence: {decision.confidence:.3f}"
+        if decision.confidence is not None
+        else "Confidence: N/A"
+    )
     logger.info(f"Explanation: {decision.explanation}")
     logger.info(f"Updates: {decision.updates}")
     logger.info("=" * 60)
@@ -97,14 +101,28 @@ def log_policy_update(logger, old_policy, new_policy):
     logger.info(f"New: {new_policy}")
     logger.info("=" * 40)
 
-def log_session_summary(logger, total_attempts: int, final_distance: float, success: bool):
-    """Log session summary"""
+def log_session_summary(
+    logger,
+    total_attempts: int,
+    final_distance: float,
+    success: bool,
+    *,
+    grasp_success: bool = False,
+    gripper_model: str = "",
+    failure_type: str = "",
+):
+    """Log session summary with explicit pick vs place outcomes."""
     logger.info("=" * 80)
     logger.info("SESSION SUMMARY")
     logger.info("=" * 80)
     logger.info(f"Total Attempts: {total_attempts}")
-    logger.info(f"Final Distance: {final_distance:.3f}m")
-    logger.info(f"Success: {'YES' if success else 'NO'}")
+    logger.info(f"Final Distance (cube–goal): {final_distance:.3f}m")
+    logger.info(f"Place succeeded (stable at goal): {'YES' if success else 'NO'}")
+    logger.info(f"Pick succeeded (contacts + lift test): {'YES' if grasp_success else 'NO'}")
+    if gripper_model:
+        logger.info(f"Gripper URDF: {gripper_model}")
+    if failure_type:
+        logger.info(f"Last failure / exit note: {failure_type}")
     logger.info("=" * 80)
     logger.info("ROBOT EXECUTION SESSION ENDED")
     logger.info("=" * 80)
